@@ -881,7 +881,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         else:
             device = get_device_id()  # used when fsdp2 set cpu_offload_policy
             per_tensor_param = (
-                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param.to(device, non_blocking=True))
                 for name, param in params.items()
             )
 
@@ -912,7 +912,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             and self.config.rollout.free_cache_engine
         ):
             per_tensor_base_params = (
-                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param.to(device, non_blocking=True))
                 for name, param in base_model_params.items()
             )
             await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)
