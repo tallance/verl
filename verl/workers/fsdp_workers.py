@@ -140,6 +140,58 @@ def get_vl_model_vision_tower(vl_model_instance):
     return None
 
 
+
+
+def _merge_lora_into_base_params(base_params, lora_params, peft_config):
+    """Merge LoRA weights into base model weights for SGLang weight sync.
+
+    SGLang runs a plain HF model (not PEFT), so it can't apply LoRA deltas.
+    Computes W_merged = W_base + (alpha/r) * lora_B @ lora_A for each target.
+    """
+    import re as _re
+    merged = dict(base_params)
+    scaling = peft_config.lora_alpha / peft_config.r
+
+    # Group LoRA params by module path
+    lora_modules = {}
+    for name, param in lora_params.items():
+        # PEFT names: base_model.model.<path>.lora_A.default.weight
+        match = _re.match(r"base_model\.model\.(.+)\.(lora_[AB])\.weight", name)
+        if match:
+            module_path = match.group(1)
+            lora_type = match.group(2)
+            if module_path not in lora_modules:
+                lora_modules[module_path] = {}
+            lora_modules[module_path][lora_type] = param
+
+    # Merge: W = W_base + scaling * B @ A
+    merged_count = 0
+    for module_path, lora in lora_modules.items():
+        if "lora_A" in lora and "lora_B" in lora:
+            base_key = f"{module_path}.weight"
+            if base_key in merged:
+                delta = scaling * (lora["lora_B"].float() @ lora["lora_A"].float())
+                merged[base_key] = (merged[base_key].float() + delta).to(merged[base_key].dtype)
+                merged_count += 1
+
+    # --- WEIGHT_DIAG: compute norms of LoRA deltas and merged weights ---
+    _delta_norm_sq = 0.0
+    _merged_norm_sq = 0.0
+    for _k, _v in merged.items():
+        _merged_norm_sq += _v.float().norm().item() ** 2
+    _merged_norm = _merged_norm_sq ** 0.5
+    for _mp, _lora in lora_modules.items():
+        if "lora_A" in _lora and "lora_B" in _lora:
+            _d = scaling * (_lora["lora_B"].float() @ _lora["lora_A"].float())
+            _delta_norm_sq += _d.norm().item() ** 2
+    _delta_norm = _delta_norm_sq ** 0.5
+    logger.info(f"Merged LoRA into {merged_count} base weight matrices (scaling={scaling})")
+    print(f"WEIGHT_DIAG weight_sync merged_count={merged_count} "
+          f"lora_delta_norm={_delta_norm:.6f} merged_total_norm={_merged_norm:.6f}",
+          flush=True)
+    return merged
+
+
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
@@ -752,13 +804,44 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
         if hasattr(peft_model, "peft_config"):  # LoRA
             peft_config = peft_model.peft_config.get("default", None)
-            params = collect_lora_params(
-                module=self.actor_module_fsdp,
-                layered_summon=self.config.rollout.get("layered_summon", False),
-                base_sync_done=self.base_sync_done,
-            )
-            if not self.base_sync_done:
-                params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
+            if self.config.rollout.name == "sglang":
+                # SGLang runs a plain HF model — can't apply LoRA deltas.
+                # Must merge LoRA into base weights every step because:
+                # (1) sleep_replicas() destroys all SGLang weights each step
+                # (2) SGLang ignores LoRA params (name mismatch)
+                base_params = collect_lora_params(
+                    module=self.actor_module_fsdp,
+                    layered_summon=False,
+                    base_sync_done=False,
+                )
+                lora_state = collect_lora_params(
+                    module=self.actor_module_fsdp,
+                    layered_summon=False,
+                    base_sync_done=True,
+                )
+                # --- WEIGHT_DIAG: log raw LoRA param norms before merge ---
+                _lora_a_sq = 0.0
+                _lora_b_sq = 0.0
+                _n_lora = 0
+                for _ln, _lp in lora_state.items():
+                    if "lora_A" in _ln:
+                        _lora_a_sq += _lp.float().norm().item() ** 2
+                    elif "lora_B" in _ln:
+                        _lora_b_sq += _lp.float().norm().item() ** 2
+                    _n_lora += 1
+                print(f"WEIGHT_DIAG actor_lora lora_A_norm={_lora_a_sq**0.5:.6f} "
+                      f"lora_B_norm={_lora_b_sq**0.5:.6f} num_lora_params={_n_lora}",
+                      flush=True)
+                params = _merge_lora_into_base_params(base_params, lora_state, peft_config)
+                del base_params, lora_state
+            else:
+                params = collect_lora_params(
+                    module=self.actor_module_fsdp,
+                    layered_summon=self.config.rollout.get("layered_summon", False),
+                    base_sync_done=self.base_sync_done,
+                )
+                if not self.base_sync_done:
+                    params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
         else:
             params = self.actor_module_fsdp.state_dict()
 
@@ -843,7 +926,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             await self.rollout.resume(tags=["kv_cache"])
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
-        self.base_sync_done = True
+        if self.config.rollout.name != "sglang":
+            self.base_sync_done = True
         set_expandable_segments(True)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
