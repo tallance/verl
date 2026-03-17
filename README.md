@@ -17,6 +17,16 @@
 
 </div>
 
+> **Note:** This is a fork of [verl](https://github.com/volcengine/verl) maintained for the [user_sim](https://github.com/tallance/user_sim) project.
+> The `user-sim-patches` branch contains two fixes for **SGLang + LoRA weight synchronization** during GRPO training:
+>
+> 1. **Merge LoRA into base weights** before each SGLang weight sync (SGLang expects merged HF-format weights, not separate LoRA adapters)
+> 2. **Move CPU tensors to GPU** before weight sync (fixes crash when `base_sync_done=False` returns CPU-resident tensors)
+>
+> These patches will be removed once upstream [veRL PR #5564](https://github.com/volcengine/verl/pull/5564) is merged.
+
+---
+
 ![seed logo](https://github.com/user-attachments/assets/c42e675e-497c-4508-8bb9-093ad4d1f216)
 
 <h1 style="text-align: center;">verl: Volcano Engine Reinforcement Learning for LLMs</h1>
